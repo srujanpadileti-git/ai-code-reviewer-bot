@@ -1,9 +1,6 @@
 import Parser from "tree-sitter";
 import JavaScript from "tree-sitter-javascript";
-import * as TypeScript from "tree-sitter-typescript";
-
-type TSLanguage = unknown;
-const TSLang = (TypeScript as any).typescript as TSLanguage;
+import TypeScriptMod from "tree-sitter-typescript"; // robust default import
 
 export type SymbolContext = {
   language: "ts" | "js" | "unknown";
@@ -20,17 +17,36 @@ export function detectLang(path: string): "ts" | "js" | "unknown" {
   return "unknown";
 }
 
+// Try to obtain a valid Tree-sitter Language for TypeScript across ESM/CJS variants.
+// If not found, return null and we'll fall back to JavaScript grammar.
+function getTypeScriptLanguage(): any | null {
+  const m = TypeScriptMod as any;
+  const lang =
+    m?.typescript ??        // common CJS export
+    m?.default?.typescript; // some ESM interop builds
+  return lang ?? null;
+}
+
 export function extractContextForRange(
   filePath: string,
   sourceCode: string,
   startLine: number,
   endLine: number
 ): SymbolContext {
-  const lang = detectLang(filePath);
+  const langHint = detectLang(filePath);
   const parser = new Parser();
-  if (lang === "ts") parser.setLanguage(TSLang);
-  else if (lang === "js") parser.setLanguage(JavaScript);
-  else {
+
+  if (langHint === "ts") {
+    const tsLang = getTypeScriptLanguage();
+    try {
+      parser.setLanguage(tsLang ?? JavaScript);
+    } catch {
+      // Safety: if Actions runtime gives a bad object, fall back to JS grammar
+      parser.setLanguage(JavaScript);
+    }
+  } else if (langHint === "js") {
+    parser.setLanguage(JavaScript);
+  } else {
     const s = sliceWindow(sourceCode, startLine, endLine, 30);
     return { language: "unknown", symbolName: null, symbolType: "unknown", ...s };
   }
@@ -51,10 +67,10 @@ export function extractContextForRange(
   }
 
   const window = sliceWindow(sourceCode, startLine, endLine, 30);
-  return { language: lang, symbolName, symbolType, ...window };
+  return { language: langHint, symbolName, symbolType, ...window };
 }
 
-/* helpers */
+/* ---------- helpers ---------- */
 function isFunction(n: Parser.SyntaxNode) {
   return ["function_declaration", "function", "arrow_function", "function_expression"].includes(n.type);
 }
