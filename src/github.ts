@@ -39,3 +39,45 @@ export async function getFileContentAtRef(octokit: Octokit, owner: string, repo:
   const buff = Buffer.from(b64, "base64");
   return buff.toString("utf-8");
 }
+
+export async function postLineComment(
+  octokit: Octokit,
+  owner: string,
+  repo: string,
+  prNumber: number,
+  headSha: string,
+  path: string,
+  line: number,
+  body: string
+) {
+  // Single-line comment on the RIGHT (new) side using absolute new-file line number
+  await (octokit as any).pulls.createReviewComment({
+    owner, repo, pull_number: prNumber,
+    commit_id: headSha,
+    path,
+    side: "RIGHT",
+    line,
+    body
+  });
+}
+
+export async function createOrUpdateCheck(
+  octokit: Octokit,
+  owner: string,
+  repo: string,
+  headSha: string,
+  summaryMd: string
+) {
+  // Create a neutral check run with our summary
+  await (octokit as any).checks.create({
+    owner, repo,
+    name: "ai-code-review summary",
+    head_sha: headSha,
+    status: "completed",
+    conclusion: "neutral",
+    output: {
+      title: "AI Code Review",
+      summary: summaryMd
+    }
+  });
+}
