@@ -3,6 +3,8 @@ import { Octokit } from "@octokit/rest";
 import { getPRContext, getChangedFiles, getFileContentAtRef } from "./github.js";
 import { parsePatchToHunks } from "./diff.js";
 import { extractContextForRange, detectLang } from "./ast.js";
+import { systemPrompt, buildUserPrompt, safeParseFindings } from "./prompts.js";
+import { callModel } from "./model.js";
 
 async function run() {
   try {
@@ -11,30 +13,63 @@ async function run() {
     const octokit = new Octokit({ auth: token });
 
     const { owner, repo, prNumber, headSha } = getPRContext();
+    const fullRepo = `${owner}/${repo}`;
     const changed = await getChangedFiles(octokit, owner, repo, prNumber);
 
-    console.log(`🔎 Reviewing PR #${prNumber} in ${owner}/${repo}`);
+    console.log(`🤖 Day 3: LLM dry-run review for PR #${prNumber} in ${fullRepo}`);
+
     for (const file of changed) {
       const lang = detectLang(file.filename);
-      if (!["ts", "js"].includes(lang)) continue; // Day 2: only TS/JS
+      if (!["ts", "js"].includes(lang)) continue;
 
-      // Get the latest file contents at the PR head
       const source = await getFileContentAtRef(octokit, owner, repo, file.filename, headSha);
-
-      // Turn the unified diff patch into (start,end) line ranges
       const hunks = parsePatchToHunks(file.patch);
       if (hunks.length === 0) continue;
 
       console.log(`\n📄 ${file.filename}`);
+
       for (const h of hunks) {
         const ctx = extractContextForRange(file.filename, source, h.startLine, h.endLine);
-        console.log(`  • Changed lines: ${h.startLine}-${h.endLine}`);
-        console.log(`    Nearest: ${ctx.symbolType}${ctx.symbolName ? ` ${ctx.symbolName}` : ""}`);
-        console.log(`    Snippet ${ctx.snippetStartLine}-${ctx.snippetEndLine}:\n${indent(ctx.snippet, 6)}`);
+
+        const messages = [
+          { role: "system" as const, content: systemPrompt() },
+          {
+            role: "user" as const,
+            content: buildUserPrompt({
+              repo: fullRepo,
+              filePath: file.filename,
+              startLine: h.startLine,
+              endLine: h.endLine,
+              symbolType: ctx.symbolType,
+              symbolName: ctx.symbolName,
+              snippetStart: ctx.snippetStartLine,
+              snippetEnd: ctx.snippetEndLine,
+              snippet: ctx.snippet
+            })
+          }
+        ];
+
+        // Call the model and print the JSON findings
+        let raw = "[]";
+        try {
+          raw = await callModel(messages);
+        } catch (e: any) {
+          console.log(`  ⚠️  Model error: ${e.message?.slice(0, 200)}`);
+          raw = "[]";
+        }
+        const findings = safeParseFindings(raw);
+
+        console.log(`  • Changed lines ${h.startLine}-${h.endLine}`);
+        if (findings.length === 0) {
+          console.log("    (no material issues found)");
+        } else {
+          console.log("    Findings (JSON):");
+          console.log(indent(JSON.stringify(findings, null, 2), 6));
+        }
       }
     }
 
-    console.log("\n✅ Day 2 complete: AST context + snippets printed.");
+    console.log("\n✅ Day 3 complete: model-produced JSON printed (dry-run).");
   } catch (err: any) {
     core.setFailed(err.message);
   }
