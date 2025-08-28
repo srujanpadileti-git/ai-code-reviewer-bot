@@ -1,9 +1,9 @@
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
-import { getEmbedding, cosineSim } from "./embeddings.js";
 import { chunkFileByAst } from "./ast.js";
 import { buildConfig } from "./config.js"; // we use its allowFile()
+import { getEmbedding, cosineSim, EmbeddingError } from "./embeddings.js";
 
 export type IndexEntry = {
   id: string;                // hash of path+range
@@ -49,53 +49,76 @@ function listAllFiles(root: string): string[] {
 }
 
 export async function ensureRepoIndex(labels: string[], env: NodeJS.ProcessEnv): Promise<RepoIndex | null> {
+  // Allow hard-off switches
+  if (env.RAG_DISABLE === "1" || env.RAG_K === "0") {
+    console.log("🔕 RAG disabled via env (RAG_K=0 or RAG_DISABLE=1)");
+    return null;
+  }
+
   const cfg = buildConfig(labels, env);
-  // Load if exists
+
+  // If an index already exists, try to load it (best-effort)
   if (fs.existsSync(INDEX_PATH)) {
     try {
       const raw = fs.readFileSync(INDEX_PATH, "utf8");
       const parsed = JSON.parse(raw) as RepoIndex;
       return parsed;
-    } catch { /* fall through to rebuild */ }
-  }
-
-  // Build fresh
-  fs.mkdirSync(INDEX_DIR, { recursive: true });
-  const root = process.cwd();
-  const files = listAllFiles(root)
-    .filter(p => p.endsWith(".ts") || p.endsWith(".tsx") || p.endsWith(".js") || p.endsWith(".jsx"))
-    .map(p => p.replace(root + path.sep, ""))    // make them relative
-    .filter(cfg.allowFile);
-
-  const model = process.env.EMBEDDING_MODEL || "text-embedding-3-small";
-  const entries: IndexEntry[] = [];
-  for (const rel of files) {
-    const full = path.join(root, rel);
-    const source = fs.readFileSync(full, "utf8");
-    const fileHash = sha1(source);
-
-    const chunks = chunkFileByAst(rel, source).slice(0, 200); // safety cap per file
-    for (const c of chunks) {
-      const id = sha1(`${rel}:${c.startLine}-${c.endLine}:${fileHash}`);
-      // Avoid duplicate if we happened to have an old index (we didn't load it though)
-      const vec = await getEmbedding(`${rel}\n${c.symbolType} ${c.symbolName ?? ""}\n${c.snippet}`);
-      entries.push({
-        id,
-        path: rel,
-        startLine: c.startLine,
-        endLine: c.endLine,
-        symbolType: c.symbolType,
-        symbolName: c.symbolName,
-        snippet: c.snippet,
-        fileHash,
-        embedding: vec
-      });
+    } catch {
+      /* continue to rebuild */
     }
   }
 
-  const idx: RepoIndex = { model, createdAt: new Date().toISOString(), entries };
-  fs.writeFileSync(INDEX_PATH, JSON.stringify(idx));
-  return idx;
+  // Build fresh index (best-effort)
+  try {
+    fs.mkdirSync(INDEX_DIR, { recursive: true });
+    const root = process.cwd();
+    const files = listAllFiles(root)
+      .filter((p) => p.endsWith(".ts") || p.endsWith(".tsx") || p.endsWith(".js") || p.endsWith(".jsx"))
+      .map((p) => p.replace(root + path.sep, ""))
+      .filter(cfg.allowFile);
+
+    const model = process.env.EMBEDDING_MODEL || "text-embedding-3-small";
+    const entries: IndexEntry[] = [];
+
+    for (const rel of files) {
+      const full = path.join(root, rel);
+      const source = fs.readFileSync(full, "utf8");
+      const fileHash = sha1(source);
+
+      const chunks = chunkFileByAst(rel, source).slice(0, 200); // safety cap
+      for (const c of chunks) {
+        const id = sha1(`${rel}:${c.startLine}-${c.endLine}:${fileHash}`);
+        try {
+          const vec = await getEmbedding(`${rel}\n${c.symbolType} ${c.symbolName ?? ""}\n${c.snippet}`);
+          entries.push({
+            id,
+            path: rel,
+            startLine: c.startLine,
+            endLine: c.endLine,
+            symbolType: c.symbolType,
+            symbolName: c.symbolName,
+            snippet: c.snippet,
+            fileHash,
+            embedding: vec,
+          });
+        } catch (e: any) {
+          if (e instanceof EmbeddingError && e.code === "QUOTA") {
+            console.log("⚠️  Embedding quota/rate-limit hit — disabling RAG for this run.");
+            return null; // fail-open: no RAG, but keep the review running
+          }
+          console.log(`⚠️  Embedding error for ${rel}:${c.startLine}-${c.endLine} — skipping chunk: ${String(e?.message || e)}`);
+          // continue to next chunk
+        }
+      }
+    }
+
+    const idx: RepoIndex = { model, createdAt: new Date().toISOString(), entries };
+    fs.writeFileSync(INDEX_PATH, JSON.stringify(idx));
+    return idx;
+  } catch (e: any) {
+    console.log(`⚠️  Failed to build RAG index — proceeding without RAG. ${String(e?.message || e)}`);
+    return null;
+  }
 }
 
 export async function retrieveSimilar(

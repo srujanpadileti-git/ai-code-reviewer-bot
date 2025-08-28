@@ -51,8 +51,8 @@ async function run() {
     console.log(`   Comments via ${reviewerToken ? "REVIEWER_TOKEN (your account)" : "GITHUB_TOKEN (bot)"}`);
 
     // Day 6: Build/load repo RAG index and set Top-K
-    const ragK = Number(process.env.RAG_K || "6");
-    const repoIndex = await ensureRepoIndex(labels, process.env);
+    const ragK = Math.max(0, Number(process.env.RAG_K || "6"));
+    const repoIndex = ragK > 0 ? await ensureRepoIndex(labels, process.env) : null;
     console.log(`📚 RAG index: ${repoIndex ? repoIndex.entries.length : 0} chunks loaded, topK=${ragK}`);
 
     const runStart = Date.now();
@@ -88,7 +88,7 @@ async function run() {
         const ctx = extractContextForRange(path, source, h.startLine, h.endLine);
 
         // Retrieve related repo context (RAG)
-        const related = await retrieveSimilar(repoIndex, ctx.snippet, path, ragK);
+        const related = ragK > 0 ? await retrieveSimilar(repoIndex, ctx.snippet, path, ragK) : [];
 
         // Build messages for the model
         const messages = [
