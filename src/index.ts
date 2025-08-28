@@ -7,65 +7,75 @@ import {
   getFileContentAtRef,
   postLineComment,
   createOrUpdateCheck,
+  getPRLabels,
 } from "./github.js";
 
 import { parsePatchToHunks } from "./diff.js";
 import { extractContextForRange, detectLang } from "./ast.js";
 import { systemPrompt, buildUserPrompt, safeParseFindings } from "./prompts.js";
-import { callModel } from "./model.js";
+import { callModel, type ModelCall } from "./model.js";
 import { aggregateFindings, type Finding } from "./aggregator.js";
 import { toCommentBody } from "./suggestions.js";
+import { buildConfig } from "./config.js";
 
 async function run() {
   try {
     // Tokens:
-    // - GITHUB_TOKEN (always present in Actions): use for reading repo + creating Checks
-    // - REVIEWER_TOKEN (optional, your fine-grained PAT): use for posting comments as YOU
     const githubToken = process.env.GITHUB_TOKEN;
     if (!githubToken) throw new Error("GITHUB_TOKEN missing (Actions should provide this automatically).");
     const reviewerToken = process.env.REVIEWER_TOKEN || "";
 
-    // Three clients (can point to different tokens)
-    const dataClient = new Octokit({ auth: githubToken });                 // reads (files/PR info)
-    const commentsClient = new Octokit({ auth: reviewerToken || githubToken }); // posts review comments
-    const checksClient = new Octokit({ auth: githubToken });               // Checks API
+    // Clients
+    const dataClient     = new Octokit({ auth: githubToken });                  // reads
+    const commentsClient = new Octokit({ auth: reviewerToken || githubToken }); // comments (your PAT if provided)
+    const checksClient   = new Octokit({ auth: githubToken });                  // checks
 
     const { owner, repo, prNumber, headSha } = getPRContext();
     const fullRepo = `${owner}/${repo}`;
-    const maxComments = Number(process.env.MAX_COMMENTS || "10");
 
-    console.log(`📝 Day 4: posting real comments on PR #${prNumber} (${fullRepo})`);
-    console.log(`   Using ${reviewerToken ? "REVIEWER_TOKEN (comments as YOU)" : "GITHUB_TOKEN (bot)"} for comments`);
-    console.log(`   MAX_COMMENTS = ${maxComments}`);
+    // === New: read labels → build config ===
+    const labels = await getPRLabels(dataClient, owner, repo, prNumber);
+    const cfg = buildConfig(labels, process.env);
 
-    // Collect all findings across all changed hunks
+    if (cfg.skipAll) {
+      console.log("⏭️  Skipping review due to label `ai-review:skip` or SKIP_ALL=1.");
+      return;
+    }
+
+    console.log(`🛠️  Config: max=${cfg.maxComments}, dryRun=${cfg.dryRun}, only=[${cfg.onlyGlobs.join(", ")}], skip=[${cfg.skipGlobs.join(", ")}]`);
+    console.log(`   Comments via ${reviewerToken ? "REVIEWER_TOKEN (your account)" : "GITHUB_TOKEN (bot)"}`);
+
+    const t0 = Date.now();
+    let totalPrompt = 0, totalOut = 0, totalTokens = 0;
+
+    // Collect findings
     const allFindings: Finding[] = [];
-
     const changed = await getChangedFiles(dataClient, owner, repo, prNumber);
 
     for (const file of changed) {
-      const lang = detectLang(file.filename);
-      if (!["ts", "js"].includes(lang)) continue; // Day 4 scope: TS/JS only
+      const path = file.filename;
+      if (!cfg.allowFile(path)) {
+        console.log(`   🚫 Skipping ${path} (filtered)`);
+        continue;
+      }
 
-      // Source at PR head
-      const source = await getFileContentAtRef(dataClient, owner, repo, file.filename, headSha);
+      const lang = detectLang(path);
+      if (!["ts", "js"].includes(lang)) continue; // scope
 
-      // Parse unified diff to hunks
+      const source = await getFileContentAtRef(dataClient, owner, repo, path, headSha);
       const hunks = parsePatchToHunks(file.patch);
       if (hunks.length === 0) continue;
 
       for (const h of hunks) {
-        // AST context + snippet window
-        const ctx = extractContextForRange(file.filename, source, h.startLine, h.endLine);
+        const ctx = extractContextForRange(path, source, h.startLine, h.endLine);
 
-        // Build messages for the model
         const messages = [
           { role: "system" as const, content: systemPrompt() },
           {
             role: "user" as const,
             content: buildUserPrompt({
               repo: fullRepo,
-              filePath: file.filename,
+              filePath: path,
               startLine: h.startLine,
               endLine: h.endLine,
               symbolType: ctx.symbolType,
@@ -77,71 +87,63 @@ async function run() {
           },
         ];
 
-        // Query model → JSON array (or [])
-        let raw = "[]";
-        try {
-          raw = await callModel(messages);
-        } catch (e: any) {
-          console.log(`  ⚠️  Model error: ${String(e?.message || e).slice(0, 200)}`);
-          raw = "[]";
-        }
-        const findings = safeParseFindings(raw);
+        let out: ModelCall = { text: "[]", promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+        try { out = await callModel(messages); }
+        catch (e: any) { console.log(`  ⚠️  Model error: ${String(e?.message || e).slice(0, 200)}`); }
 
-        // Ensure required fields are set
+        totalPrompt += out.promptTokens;
+        totalOut    += out.completionTokens;
+        totalTokens += out.totalTokens;
+
+        const findings = safeParseFindings(out.text);
         for (const f of findings) {
-          f.path = f.path || file.filename;
+          f.path = f.path || path;
           f.start_line = f.start_line || h.startLine;
           f.end_line = f.end_line || h.endLine;
-          // Basic sanity defaults
           if (!f.category) f.category = "style";
           if (!f.severity) f.severity = "low";
           if (!f.title) f.title = "Suggested improvement";
         }
-
         allFindings.push(...findings);
       }
     }
 
-    // Rank + dedupe + cap
-    const { top, counts } = aggregateFindings(allFindings, maxComments);
+    const { top, counts } = aggregateFindings(allFindings, cfg.maxComments);
 
-    // Post line comments
-    for (const f of top) {
-      const body = toCommentBody(f);
-      try {
-        await postLineComment(
-          commentsClient,
-          owner,
-          repo,
-          prNumber,
-          headSha,
-          f.path,
-          f.end_line, // single-line comment on the changed end line
-          body
-        );
-        console.log(`  ✅ Comment posted: ${f.path}:${f.end_line} — ${f.title}`);
-      } catch (e: any) {
-        console.log(
-          `  ⚠️  Failed to post comment at ${f.path}:${f.end_line} — ${String(e?.message || e).slice(0, 200)}`
-        );
+    // Post comments (unless dry-run)
+    if (cfg.dryRun) {
+      console.log("🧪 Dry-run mode: not posting comments. Findings would be:");
+      console.log(JSON.stringify(top, null, 2));
+    } else {
+      for (const f of top) {
+        const body = toCommentBody(f);
+        try {
+          await postLineComment(commentsClient, owner, repo, prNumber, headSha, f.path, f.end_line, body);
+          console.log(`  ✅ Comment posted: ${f.path}:${f.end_line} — ${f.title}`);
+        } catch (e: any) {
+          console.log(`  ⚠️  Failed to post comment at ${f.path}:${f.end_line} — ${String(e?.message || e).slice(0, 200)}`);
+        }
       }
     }
 
-    // Checks summary (created with GITHUB_TOKEN)
+    // Metrics
+    const seconds = ((Date.now() - t0) / 1000).toFixed(1);
+    let costLine = "_Set COST_IN_PER_1K and COST_OUT_PER_1K in the workflow to estimate $ cost._";
+    if (cfg.costInPer1K > 0 || cfg.costOutPer1K > 0) {
+      const est = (totalPrompt / 1000) * cfg.costInPer1K + (totalOut / 1000) * cfg.costOutPer1K;
+      costLine = `Estimated cost: ~$${est.toFixed(4)} (in=${cfg.costInPer1K}/1k, out=${cfg.costOutPer1K}/1k)`;
+    }
+
     const summaryMd =
       `**AI Code Review summary**\n\n` +
-      `- Total posted: **${top.length}** (cap ${maxComments})\n` +
-      `- Severity: high **${counts.high}**, medium **${counts.medium}**, low **${counts.low}**\n\n` +
+      `- Total posted: **${cfg.dryRun ? 0 : top.length}** (cap ${cfg.maxComments})\n` +
+      `- Severity: high **${counts.high}**, medium **${counts.medium}**, low **${counts.low}**\n` +
+      `- Tokens: prompt **${totalPrompt}**, out **${totalOut}**, total **${totalTokens}**\n` +
+      `- Time: **${seconds}s**\n` +
+      `- ${costLine}\n\n` +
       (top.length
-        ? top
-            .map(
-              (f, i) =>
-                `${i + 1}. \`${f.path}:${f.start_line}-${f.end_line}\` — **${f.severity.toUpperCase()} ${f.category}** — ${escapeMd(
-                  f.title
-                )}`
-            )
-            .join("\n")
-        : "_No material issues posted._");
+        ? top.map((f, i) => `${i + 1}. \`${f.path}:${f.start_line}-${f.end_line}\` — **${f.severity.toUpperCase()} ${f.category}** — ${escapeMd(f.title)}`).join("\n")
+        : "_No material issues._");
 
     try {
       await createOrUpdateCheck(checksClient, owner, repo, headSha, summaryMd);
@@ -150,14 +152,12 @@ async function run() {
       console.log(`  ⚠️  Failed to post Checks summary — ${String(e?.message || e).slice(0, 200)}`);
     }
 
-    console.log("\n✅ Day 4 complete: comments + summary posted.");
+    console.log("\n✅ Day 5 complete: labels, filters, and metrics added.");
   } catch (err: any) {
     core.setFailed(err.message);
   }
 }
 
-function escapeMd(s: string) {
-  return s.replace(/[_*`]/g, (m) => "\\" + m);
-}
+function escapeMd(s: string) { return s.replace(/[_*`]/g, (m) => "\\" + m); }
 
 run();

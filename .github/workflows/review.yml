@@ -25,4 +25,6 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           CHAT_MODEL: gpt-4o-mini
           MAX_COMMENTS: "10"
+          COST_IN_PER_1K: "0"
+          COST_OUT_PER_1K: "0"
         run: node dist/index.js

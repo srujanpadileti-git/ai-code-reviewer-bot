@@ -81,3 +81,8 @@ export async function createOrUpdateCheck(
     }
   });
 }
+
+export async function getPRLabels(octokit: Octokit, owner: string, repo: string, prNumber: number): Promise<string[]> {
+  const { data } = await octokit.issues.listLabelsOnIssue({ owner, repo, issue_number: prNumber, per_page: 100 });
+  return data.map(l => l.name);
+}
