@@ -9,3 +9,4 @@ def greet(name):
     data = pickle.loads(b"...")
     # yaml without SafeLoader
     yaml.load("a: 1")
+print("hello")
