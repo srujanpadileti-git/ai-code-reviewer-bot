@@ -42,6 +42,7 @@ export function buildUserPrompt(args: {
   snippetStart: number;
   snippetEnd: number;
   snippet: string;
+  related?: Array<{ path: string; startLine: number; endLine: number; symbolType: string; symbolName: string | null; snippet: string }>;
 }) {
   const header =
     `Repository: ${args.repo}\n` +
@@ -49,7 +50,17 @@ export function buildUserPrompt(args: {
     `Changed lines: ${args.startLine}-${args.endLine}\n` +
     `Nearest symbol: ${args.symbolType}${args.symbolName ? " " + args.symbolName : ""}\n` +
     `Context snippet ${args.snippetStart}-${args.snippetEnd}:\n`;
-  return header + "```ts\n" + args.snippet + "\n```";
+  let body = header + "```ts\n" + args.snippet + "\n```";
+
+  if (args.related && args.related.length) {
+    body += `\n\nRelated repo context (top ${args.related.length}):\n`;
+    for (const r of args.related) {
+      body += `\n- ${r.path}:${r.startLine}-${r.endLine} (${r.symbolType}${r.symbolName ? " " + r.symbolName : ""})\n`;
+      body += "```ts\n" + r.snippet + "\n```\n";
+    }
+  }
+
+  return body;
 }
 
 // Helper to safely parse whatever the model spits out into an array

@@ -105,3 +105,48 @@ function sliceWindow(source: string, startLine: number, endLine: number, pad: nu
   const snippet = lines.slice(from - 1, to).join("\n");
   return { snippet, snippetStartLine: from, snippetEndLine: to };
 }
+
+export type Chunk = {
+  symbolType: "function" | "method" | "class" | "unknown";
+  symbolName: string | null;
+  startLine: number;
+  endLine: number;
+  snippet: string;
+};
+
+export function chunkFileByAst(filePath: string, sourceCode: string): Chunk[] {
+  const lang = detectLang(filePath);
+  const parser = new Parser();
+  if (lang === "ts") parser.setLanguage((TypeScriptMod as any).typescript || JavaScript);
+  else if (lang === "js") parser.setLanguage(JavaScript);
+  else return []; // only TS/JS today
+
+  const root = parser.parse(sourceCode).rootNode;
+  const chunks: Chunk[] = [];
+
+  function visit(n: Parser.SyntaxNode) {
+    if (isFunction(n) || isMethod(n) || isClass(n)) {
+      const symbolType = isFunction(n) ? "function" : isMethod(n) ? "method" : "class";
+      const symbolName = nameFor(n);
+      const startLine = n.startPosition.row + 1;
+      const endLine = n.endPosition.row + 1;
+      const snippet = sourceCode.split("\n").slice(startLine - 1, endLine).join("\n");
+      chunks.push({ symbolType, symbolName, startLine, endLine, snippet });
+    }
+    for (const c of n.children) visit(c);
+  }
+  visit(root);
+
+  // Fallback: if file is tiny or weird, return one whole-file window
+  if (chunks.length === 0) {
+    const lines = sourceCode.split("\n");
+    chunks.push({
+      symbolType: "unknown",
+      symbolName: null,
+      startLine: 1,
+      endLine: lines.length,
+      snippet: sourceCode
+    });
+  }
+  return chunks;
+}
