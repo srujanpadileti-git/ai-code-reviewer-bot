@@ -1,0 +1,52 @@
+name: ai-review-eval
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch: {}
+
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Run rules eval
+        env:
+          MIN_RULES_RECALL: "0.5"
+        run: npm run eval
+
+      - name: Upload eval report
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-report
+          path: .aicr/eval_report.md
+
+      - name: Comment results on PR
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('.aicr/eval_report.md', 'utf8');
+            // Find existing comment by this workflow and update; otherwise create new
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+            const header = '**AI Code Reviewer — Rules Evaluation**';
+            const { data: comments } = await github.rest.issues.listComments({ owner, repo, issue_number, per_page: 100 });
+            const mine = comments.find(c => c.user.type === 'Bot' && c.body && c.body.includes(header));
+            if (mine) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: mine.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
