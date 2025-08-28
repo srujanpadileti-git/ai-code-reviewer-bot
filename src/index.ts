@@ -27,6 +27,9 @@ import {
   toAllowedCats,
 } from "./autofix.js";
 
+import pLimit from "p-limit";
+import { ensureCache, saveCache, hashKey, getFresh, put } from "./cache.js";
+
 async function run() {
   try {
     // Tokens:
@@ -58,7 +61,11 @@ async function run() {
     );
     console.log(`   Comments via ${reviewerToken ? "REVIEWER_TOKEN (your account)" : "GITHUB_TOKEN (bot)"}`);
     console.log(`   Rules: enabled=${cfg.rulesEnabled}, rulesOnly=${cfg.rulesOnly}, allowConsole=${cfg.allowConsole}`);
-    console.log(`   Auto-fix: enabled=${cfg.autoFix}, scopes=[${cfg.fixScopes.join(", ")}], maxFixLines=${cfg.maxFixLines}`);
+
+    // Performance budgets (Day 10)
+    console.log(
+      `   Perf: maxModelCalls=${cfg.maxModelCalls}, timeBudgetSec=${cfg.timeBudgetSec}, tokenBudget=${cfg.tokenBudget}, maxParallel=${cfg.maxParallel}, useCache=${cfg.useCache}`
+    );
 
     // Day 6: Build/load repo RAG index (fail-open) and set Top-K
     const ragK = Math.max(0, Number(process.env.RAG_K || "6"));
@@ -70,6 +77,19 @@ async function run() {
     let totalPrompt = 0;
     let totalOut = 0;
     let totalTokens = 0;
+
+    // Budgets & cache trackers
+    const startMs = Date.now();
+    let callCount = 0;
+    let tokensSoFar = 0;
+
+    const cache = cfg.useCache ? ensureCache() : {};
+    const ttlHours = Number(process.env.CACHE_TTL_HOURS || "168"); // default 7d
+    const limit = pLimit(cfg.maxParallel);
+
+    // We'll collect all "model tasks" here to run in parallel later
+    type TaskResult = { findings: Finding[]; promptTokens: number; completionTokens: number; totalTokens: number };
+    const modelTasks: Array<() => Promise<TaskResult>> = [];
 
     const allFindings: Finding[] = [];
     const changed = await getChangedFiles(dataClient, owner, repo, prNumber);
@@ -113,7 +133,7 @@ async function run() {
         // 2) Skip model entirely if rules-only mode is on
         if (cfg.rulesOnly) continue;
 
-        // Retrieve related repo context (RAG) for the model
+        // Retrieve related repo context (RAG) for the model (now, so cache key is stable)
         const related = ragK > 0 ? await retrieveSimilar(repoIndex, ctx.snippet, filePath, ragK) : [];
 
         // Build messages for the model
@@ -136,29 +156,87 @@ async function run() {
           },
         ];
 
-        // Call model (returns text + token usage)
-        let out: ModelCall = { text: "[]", promptTokens: 0, completionTokens: 0, totalTokens: 0 };
-        try {
-          out = await callModel(messages);
-        } catch (e: any) {
-          console.log(`  ⚠️  Model error: ${String(e?.message || e).slice(0, 200)}`);
-        }
-        totalPrompt += out.promptTokens;
-        totalOut += out.completionTokens;
-        totalTokens += out.totalTokens;
+        // Queue a model task with budgets + cache + limiter
+        modelTasks.push(async () => {
+          // Early-stop: time budget
+          if (((Date.now() - startMs) / 1000) > cfg.timeBudgetSec) {
+            return { findings: [], promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+          }
+          // Early-stop: call count
+          if (callCount >= cfg.maxModelCalls) {
+            return { findings: [], promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+          }
 
-        // Parse JSON → findings
-        const findings = safeParseFindings(out.text);
-        for (const f of findings) {
-          f.path = f.path || filePath;
-          f.start_line = f.start_line || h.startLine;
-          f.end_line = f.end_line || h.endLine;
-          if (!f.category) f.category = "style";
-          if (!f.severity) f.severity = "low";
-          if (!f.title) f.title = "Suggested improvement";
-        }
-        allFindings.push(...findings);
+          const model = process.env.CHAT_MODEL || "gpt-4o-mini";
+          const key = hashKey(model, messages);
+
+          // Cache hit?
+          if (cfg.useCache) {
+            const hit = getFresh(cache as any, key, ttlHours);
+            if (hit) {
+              const cachedFindings = safeParseFindings(hit.text);
+              return {
+                findings: stampFindings(cachedFindings, filePath, h.startLine, h.endLine),
+                promptTokens: 0,
+                completionTokens: 0,
+                totalTokens: 0,
+              };
+            }
+          }
+
+          // Spend a call
+          callCount++;
+
+          // Call the model
+          let out: ModelCall = { text: "[]", promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+          try {
+            out = await callModel(messages);
+          } catch (e: any) {
+            console.log(`  ⚠️  Model error: ${String(e?.message || e).slice(0, 200)}`);
+            return { findings: [], promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+          }
+
+          // Token budget (soft cap)
+          tokensSoFar += out.totalTokens;
+          if (tokensSoFar > cfg.tokenBudget) {
+            console.log(`⛔ Token budget hit (~${tokensSoFar} > ${cfg.tokenBudget}). No further model calls.`);
+            callCount = Number.MAX_SAFE_INTEGER; // block more tasks
+          }
+
+          // Save to cache
+          if (cfg.useCache) {
+            put(cache as any, key, {
+              text: out.text,
+              promptTokens: out.promptTokens,
+              completionTokens: out.completionTokens,
+              totalTokens: out.totalTokens,
+            });
+          }
+
+          // Parse JSON → findings
+          const parsed = safeParseFindings(out.text);
+          return {
+            findings: stampFindings(parsed, filePath, h.startLine, h.endLine),
+            promptTokens: out.promptTokens,
+            completionTokens: out.completionTokens,
+            totalTokens: out.totalTokens,
+          };
+        });
       }
+    }
+
+    // Execute model tasks with concurrency limit
+    const results = await Promise.all(modelTasks.map((task) => limit(task)));
+
+    // Save cache once
+    if (cfg.useCache) saveCache(cache as any);
+
+    // Collect findings + metrics from tasks
+    for (const r of results) {
+      allFindings.push(...r.findings);
+      totalPrompt += r.promptTokens;
+      totalOut += r.completionTokens;
+      totalTokens += r.totalTokens;
     }
 
     // Rank, dedupe, cap
@@ -173,7 +251,9 @@ async function run() {
       const fixes = collectFixes(top, { allowedCats, maxLines: cfg.maxFixLines });
 
       if (fixes.length) {
-        console.log(`🛠️  Auto-fix planning: ${fixes.length} small edits across ${new Set(fixes.map(f => f.path)).size} file(s).`);
+        console.log(
+          `🛠️  Auto-fix planning: ${fixes.length} small edits across ${new Set(fixes.map((f) => f.path)).size} file(s).`
+        );
 
         // We’re running in a checked-out repo (actions/checkout), so write to disk
         applyFixesToDisk(process.cwd(), fixes);
@@ -186,9 +266,7 @@ async function run() {
         const token = process.env.REVIEWER_TOKEN || "";
         const actor = process.env.GITHUB_ACTOR || "ai-reviewer";
         const email = `${actor}@users.noreply.github.com`;
-        const remote = token
-          ? `https://x-access-token:${token}@github.com/${owner}/${repo}.git`
-          : undefined;
+        const remote = token ? `https://x-access-token:${token}@github.com/${owner}/${repo}.git` : undefined;
 
         try {
           autoFixSha = gitCommitAndPush(headRef, actor, email, remote) || null;
@@ -221,7 +299,7 @@ async function run() {
       }
     }
 
-    // Build Checks summary (tokens, time, cost, rag info, auto-fix)
+    // Build Checks summary (tokens, time, rag info, rules, auto-fix, budgets)
     const seconds = ((Date.now() - runStart) / 1000).toFixed(1);
     let costLine = "_Set COST_IN_PER_1K and COST_OUT_PER_1K in the workflow to estimate $ cost._";
     const costInPer1K = Number(process.env.COST_IN_PER_1K || 0);
@@ -242,7 +320,8 @@ async function run() {
       `- ${costLine}\n` +
       `- ${ragLine}\n` +
       `- Rules: enabled **${cfg.rulesEnabled}**, rules-only **${cfg.rulesOnly}**, allowConsole **${cfg.allowConsole}**\n` +
-      `- Auto-fix: ${cfg.autoFix ? (autoFixSha ? `pushed commit \`${autoFixSha.slice(0,7)}\`` : "no changes") : "disabled"}\n\n` +
+      `- Auto-fix: ${cfg.autoFix ? (autoFixSha ? `pushed commit \`${autoFixSha.slice(0, 7)}\`` : "no changes") : "disabled"}\n` +
+      `- Budgets: calls **${callCount}/${cfg.maxModelCalls}**, tokenSoftCap **${cfg.tokenBudget}**, parallel **${cfg.maxParallel}**, cache **${cfg.useCache ? "on" : "off"}**\n\n` +
       (top.length
         ? top
             .map(
@@ -261,7 +340,7 @@ async function run() {
       console.log(`  ⚠️  Failed to post Checks summary — ${String(e?.message || e).slice(0, 200)}`);
     }
 
-    console.log("\n✅ Day 9 complete: rule-based + RAG review, comments, and optional auto-fix commit.");
+    console.log("\n✅ Day 10 complete: budgets + cache + parallelism + (optional) auto-fix commit.");
   } catch (err: any) {
     core.setFailed(err.message);
   }
@@ -269,6 +348,18 @@ async function run() {
 
 function escapeMd(s: string) {
   return s.replace(/[_*`]/g, (m) => "\\" + m);
+}
+
+function stampFindings(findings: Finding[], path: string, startLine: number, endLine: number) {
+  for (const f of findings) {
+    f.path = f.path || path;
+    f.start_line = f.start_line || startLine;
+    f.end_line = f.end_line || endLine;
+    if (!f.category) f.category = "style";
+    if (!f.severity) f.severity = "low";
+    if (!f.title) f.title = "Suggested improvement";
+  }
+  return findings;
 }
 
 run();

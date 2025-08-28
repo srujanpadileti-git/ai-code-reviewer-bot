@@ -36,4 +36,10 @@ jobs:
           AUTO_FIX: "0"
           FIX_SCOPE: "style,docs,test"
           MAX_FIX_LINES: "20"   
+          MAX_MODEL_CALLS: "12"
+          TIME_BUDGET_S: "60"
+          TOKEN_BUDGET: "20000"
+          MAX_PARALLEL: "3"
+          USE_CACHE: "1"
+          CACHE_TTL_HOURS: "168" 
         run: node dist/index.js
