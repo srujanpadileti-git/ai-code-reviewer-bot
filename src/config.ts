@@ -64,6 +64,8 @@ export function buildConfig(labels: string[], env: NodeJS.ProcessEnv): ReviewCon
     "ai-review:skip-minjs": ["**/*.min.js"],
     "ai-review:skip-node_modules": ["node_modules/**"],
     "ai-review:skip-lockfiles": ["**/*.lock", "**/package-lock.json", "**/pnpm-lock.yaml", "**/yarn.lock"],
+    "ai-review:only-py": ["**/*.py"], 
+    "ai-review:skip-py": ["**/*.py"],
   };
   const shorthandOnly: string[] = [];
   const shorthandSkip: string[] = [];

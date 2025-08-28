@@ -29,8 +29,8 @@ jobs:
           MAX_COMMENTS: "10"
           COST_IN_PER_1K: "0"
           COST_OUT_PER_1K: "0"
-          ONLY: "src/**/*.ts,lib/**/*.js"
-          SKIP: "dist/**,**/*.min.js,node_modules/**"
+          ONLY: "src/**/*.ts,lib/**/*.js,**/*.py"
+          SKIP: "dist/**,**/*.min.js,node_modules/**,.aicr/**"
           RULES_ONLY: "0"
           ALLOW_CONSOLE: "0"
         run: node dist/index.js

@@ -78,7 +78,7 @@ async function run() {
 
       // Language scope (TS/JS for now)
       const lang = detectLang(path);
-      if (!["ts", "js"].includes(lang)) continue;
+      if (!["ts", "js", "py"].includes(lang)) continue;
 
       // Current file contents at PR head
       const source = await getFileContentAtRef(dataClient, owner, repo, path, headSha);
