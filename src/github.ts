@@ -86,3 +86,14 @@ export async function getPRLabels(octokit: Octokit, owner: string, repo: string,
   const { data } = await octokit.issues.listLabelsOnIssue({ owner, repo, issue_number: prNumber, per_page: 100 });
   return data.map(l => l.name);
 }
+
+export async function getPRHeadInfo(octokit: Octokit, owner: string, repo: string, prNumber: number) {
+  const { data } = await (octokit as any).pulls.get({ owner, repo, pull_number: prNumber });
+  return {
+    headRef: data.head.ref as string,
+    headSha: data.head.sha as string,
+    headRepoFull: data.head.repo.full_name as string,
+    isFork: !!data.head.repo.fork,
+    maintainerCanModify: !!data.maintainer_can_modify
+  };
+}

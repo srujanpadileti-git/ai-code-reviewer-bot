@@ -33,4 +33,7 @@ jobs:
           SKIP: "dist/**,**/*.min.js,node_modules/**,.aicr/**"
           RULES_ONLY: "0"
           ALLOW_CONSOLE: "0"
+          AUTO_FIX: "0"
+          FIX_SCOPE: "style,docs,test"
+          MAX_FIX_LINES: "20"   
         run: node dist/index.js

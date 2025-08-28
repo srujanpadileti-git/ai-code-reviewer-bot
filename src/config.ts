@@ -13,6 +13,9 @@ export type ReviewConfig = {
   rulesEnabled: boolean;
   rulesOnly: boolean;
   allowConsole: boolean;
+  autoFix: boolean;
+  fixScopes: Array<"style" | "docs" | "test" | "performance">;
+  maxFixLines: number;
 };
 
 function parseIntFromLabel(labels: string[], prefix: string, fallback: number) {
@@ -90,6 +93,17 @@ export function buildConfig(labels: string[], env: NodeJS.ProcessEnv): ReviewCon
   const rulesEnabled = !labels.includes("ai-review:no-rules") && env.NO_RULES !== "1";
   const allowConsole = labels.includes("ai-review:allow-console") || env.ALLOW_CONSOLE === "1";
 
-  return { skipAll, dryRun, maxComments, onlyGlobs, skipGlobs, allowFile, costInPer1K, costOutPer1K, rulesEnabled, rulesOnly, allowConsole };
+  const autoFix = labels.includes("ai-review:auto-fix") || env.AUTO_FIX === "1";
 
+  // What categories we’re allowed to auto-fix
+  // env FIX_SCOPE="style,docs,test,performance"
+  const scopeFromEnv = (env.FIX_SCOPE || "").split(",").map(s => s.trim()).filter(Boolean);
+  const scopeFromLabels = parseManyFromLabels ? parseManyFromLabels(labels, "ai-review:fix-scope=") : [];
+  const fixScopes = (scopeFromLabels.length ? scopeFromLabels : scopeFromEnv.length ? scopeFromEnv : ["style", "docs", "test"]) as Array<"style" | "docs" | "test" | "performance">;
+
+  // Max lines we’ll replace per finding (safety guard)
+  const maxFixLines = Number(env.MAX_FIX_LINES || "20");
+
+  return { skipAll, dryRun, maxComments, onlyGlobs, skipGlobs, allowFile, costInPer1K, costOutPer1K, rulesEnabled, rulesOnly, allowConsole, 
+    autoFix, fixScopes, maxFixLines };
 }

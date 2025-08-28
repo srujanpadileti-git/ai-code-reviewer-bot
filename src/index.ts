@@ -1,4 +1,3 @@
-// src/index.ts
 import * as core from "@actions/core";
 import { Octokit } from "@octokit/rest";
 
@@ -9,6 +8,7 @@ import {
   postLineComment,
   createOrUpdateCheck,
   getPRLabels,
+  getPRHeadInfo,
 } from "./github.js";
 
 import { parsePatchToHunks } from "./diff.js";
@@ -20,12 +20,18 @@ import { toCommentBody } from "./suggestions.js";
 import { buildConfig } from "./config.js";
 import { ensureRepoIndex, retrieveSimilar } from "./context.js";
 import { runRules } from "./rules.js";
+import {
+  collectFixes,
+  applyFixesToDisk,
+  gitCommitAndPush,
+  toAllowedCats,
+} from "./autofix.js";
 
 async function run() {
   try {
     // Tokens:
     // - GITHUB_TOKEN (from Actions): for reads + Checks API
-    // - REVIEWER_TOKEN (optional PAT): for posting comments as YOU (counts as contributions)
+    // - REVIEWER_TOKEN (optional PAT): for posting comments & commits as YOU
     const githubToken = process.env.GITHUB_TOKEN;
     if (!githubToken) throw new Error("GITHUB_TOKEN missing (Actions should provide this automatically).");
     const reviewerToken = process.env.REVIEWER_TOKEN || "";
@@ -52,6 +58,7 @@ async function run() {
     );
     console.log(`   Comments via ${reviewerToken ? "REVIEWER_TOKEN (your account)" : "GITHUB_TOKEN (bot)"}`);
     console.log(`   Rules: enabled=${cfg.rulesEnabled}, rulesOnly=${cfg.rulesOnly}, allowConsole=${cfg.allowConsole}`);
+    console.log(`   Auto-fix: enabled=${cfg.autoFix}, scopes=[${cfg.fixScopes.join(", ")}], maxFixLines=${cfg.maxFixLines}`);
 
     // Day 6: Build/load repo RAG index (fail-open) and set Top-K
     const ragK = Math.max(0, Number(process.env.RAG_K || "6"));
@@ -68,20 +75,20 @@ async function run() {
     const changed = await getChangedFiles(dataClient, owner, repo, prNumber);
 
     for (const file of changed) {
-      const path = file.filename;
+      const filePath = file.filename;
 
       // Path filters (labels/env)
-      if (!cfg.allowFile(path)) {
-        console.log(`   🚫 Skipping ${path} (filtered)`);
+      if (!cfg.allowFile(filePath)) {
+        console.log(`   🚫 Skipping ${filePath} (filtered)`);
         continue;
       }
 
-      // Language scope (TS/JS for now)
-      const lang = detectLang(path);
+      // Language scope (TS/JS/PY)
+      const lang = detectLang(filePath);
       if (!["ts", "js", "py"].includes(lang)) continue;
 
       // Current file contents at PR head
-      const source = await getFileContentAtRef(dataClient, owner, repo, path, headSha);
+      const source = await getFileContentAtRef(dataClient, owner, repo, filePath, headSha);
 
       // Parse unified diff patch → hunks
       const hunks = parsePatchToHunks(file.patch);
@@ -89,12 +96,12 @@ async function run() {
 
       for (const h of hunks) {
         // AST context around the changed range
-        const ctx = extractContextForRange(path, source, h.startLine, h.endLine);
+        const ctx = extractContextForRange(filePath, source, h.startLine, h.endLine);
 
         // 1) Deterministic rules on the changed lines (no tokens)
         if (cfg.rulesEnabled) {
           const ruleFindings = runRules({
-            path,
+            path: filePath,
             source,
             startLine: h.startLine,
             endLine: h.endLine,
@@ -107,7 +114,7 @@ async function run() {
         if (cfg.rulesOnly) continue;
 
         // Retrieve related repo context (RAG) for the model
-        const related = ragK > 0 ? await retrieveSimilar(repoIndex, ctx.snippet, path, ragK) : [];
+        const related = ragK > 0 ? await retrieveSimilar(repoIndex, ctx.snippet, filePath, ragK) : [];
 
         // Build messages for the model
         const messages = [
@@ -116,7 +123,7 @@ async function run() {
             role: "user" as const,
             content: buildUserPrompt({
               repo: fullRepo,
-              filePath: path,
+              filePath,
               startLine: h.startLine,
               endLine: h.endLine,
               symbolType: ctx.symbolType,
@@ -143,7 +150,7 @@ async function run() {
         // Parse JSON → findings
         const findings = safeParseFindings(out.text);
         for (const f of findings) {
-          f.path = f.path || path;
+          f.path = f.path || filePath;
           f.start_line = f.start_line || h.startLine;
           f.end_line = f.end_line || h.endLine;
           if (!f.category) f.category = "style";
@@ -156,6 +163,45 @@ async function run() {
 
     // Rank, dedupe, cap
     const { top, counts } = aggregateFindings(allFindings, cfg.maxComments);
+
+    // === Day 9: Auto-fix (optional) ===
+    let autoFixSha: string | null = null;
+
+    if (cfg.autoFix) {
+      // Only fix a subset we’ll actually post (avoid surprise edits outside cap)
+      const allowedCats = toAllowedCats(cfg.fixScopes);
+      const fixes = collectFixes(top, { allowedCats, maxLines: cfg.maxFixLines });
+
+      if (fixes.length) {
+        console.log(`🛠️  Auto-fix planning: ${fixes.length} small edits across ${new Set(fixes.map(f => f.path)).size} file(s).`);
+
+        // We’re running in a checked-out repo (actions/checkout), so write to disk
+        applyFixesToDisk(process.cwd(), fixes);
+
+        // Figure out PR head branch and push
+        const headInfo = await getPRHeadInfo(dataClient as any, owner, repo, prNumber);
+        const headRef = headInfo.headRef;
+
+        // Use REVIEWER_TOKEN if provided so the commit counts for you
+        const token = process.env.REVIEWER_TOKEN || "";
+        const actor = process.env.GITHUB_ACTOR || "ai-reviewer";
+        const email = `${actor}@users.noreply.github.com`;
+        const remote = token
+          ? `https://x-access-token:${token}@github.com/${owner}/${repo}.git`
+          : undefined;
+
+        try {
+          autoFixSha = gitCommitAndPush(headRef, actor, email, remote) || null;
+          if (autoFixSha) {
+            console.log(`  ✅ Auto-fix commit pushed: ${autoFixSha}`);
+          }
+        } catch (e: any) {
+          console.log(`  ⚠️  Auto-fix push skipped: ${String(e?.message || e).slice(0, 200)}`);
+        }
+      } else {
+        console.log("ℹ️  Auto-fix found nothing safe to change in the capped findings.");
+      }
+    }
 
     // Post comments (unless dry-run)
     if (cfg.dryRun) {
@@ -175,7 +221,7 @@ async function run() {
       }
     }
 
-    // Build Checks summary (tokens, time, cost, rag info)
+    // Build Checks summary (tokens, time, cost, rag info, auto-fix)
     const seconds = ((Date.now() - runStart) / 1000).toFixed(1);
     let costLine = "_Set COST_IN_PER_1K and COST_OUT_PER_1K in the workflow to estimate $ cost._";
     const costInPer1K = Number(process.env.COST_IN_PER_1K || 0);
@@ -195,7 +241,8 @@ async function run() {
       `- Time: **${seconds}s**\n` +
       `- ${costLine}\n` +
       `- ${ragLine}\n` +
-      `- Rules: enabled **${cfg.rulesEnabled}**, rules-only **${cfg.rulesOnly}**, allowConsole **${cfg.allowConsole}**\n\n` +
+      `- Rules: enabled **${cfg.rulesEnabled}**, rules-only **${cfg.rulesOnly}**, allowConsole **${cfg.allowConsole}**\n` +
+      `- Auto-fix: ${cfg.autoFix ? (autoFixSha ? `pushed commit \`${autoFixSha.slice(0,7)}\`` : "no changes") : "disabled"}\n\n` +
       (top.length
         ? top
             .map(
@@ -214,7 +261,7 @@ async function run() {
       console.log(`  ⚠️  Failed to post Checks summary — ${String(e?.message || e).slice(0, 200)}`);
     }
 
-    console.log("\n✅ Day 7 complete: rule-based checks + RAG-aware review posted.");
+    console.log("\n✅ Day 9 complete: rule-based + RAG review, comments, and optional auto-fix commit.");
   } catch (err: any) {
     core.setFailed(err.message);
   }
