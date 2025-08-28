@@ -37,20 +37,42 @@ export function buildConfig(labels: string[], env: NodeJS.ProcessEnv): ReviewCon
   const skipAll = labels.includes("ai-review:skip") || env.SKIP_ALL === "1";
   const dryRun  = labels.includes("ai-review:dry-run") || env.DRY_RUN === "1";
 
+  // max comments
   let maxComments = parseInt(env.MAX_COMMENTS || "10", 10);
-  // still allow "ai-review:max-20"
   const maxHit = labels.find(l => l.startsWith("ai-review:max-"));
   if (maxHit) {
     const n = parseInt(maxHit.slice("ai-review:max-".length), 10);
     if (Number.isFinite(n) && n > 0) maxComments = n;
   }
 
-  // Combine ENV and labels (labels take precedence by appending)
+  // ENV patterns
   const onlyFromEnv = (env.ONLY || "").split(",").map(s => s.trim()).filter(Boolean);
   const skipFromEnv = (env.SKIP || "").split(",").map(s => s.trim()).filter(Boolean);
 
-  const onlyGlobs = [...onlyFromEnv, ...parseManyFromLabels(labels, "ai-review:only=")];
-  const skipGlobs = [...skipFromEnv, ...parseManyFromLabels(labels, "ai-review:skip-paths=")];
+  // Labels with explicit patterns (no * allowed in label names, but we still parse if present)
+  const onlyFromLabels = parseManyFromLabels(labels, "ai-review:only=");
+  const skipFromLabels = parseManyFromLabels(labels, "ai-review:skip-paths=");
+
+  // Shorthand labels → real globs (safe characters only)
+  const shorthandMap: Record<string, string[]> = {
+    "ai-review:only-src-ts": ["src/**/*.ts"],
+    "ai-review:only-lib-js": ["lib/**/*.js"],
+    "ai-review:skip-dist": ["dist/**"],
+    "ai-review:skip-minjs": ["**/*.min.js"],
+    "ai-review:skip-node_modules": ["node_modules/**"],
+    "ai-review:skip-lockfiles": ["**/*.lock", "**/package-lock.json", "**/pnpm-lock.yaml", "**/yarn.lock"],
+  };
+  const shorthandOnly: string[] = [];
+  const shorthandSkip: string[] = [];
+  for (const label of labels) {
+    const globs = shorthandMap[label];
+    if (!globs) continue;
+    if (label.startsWith("ai-review:only-")) shorthandOnly.push(...globs);
+    if (label.startsWith("ai-review:skip-")) shorthandSkip.push(...globs);
+  }
+
+  const onlyGlobs = [...onlyFromEnv, ...onlyFromLabels, ...shorthandOnly];
+  const skipGlobs = [...skipFromEnv, ...skipFromLabels, ...shorthandSkip];
 
   const allow = onlyGlobs.length ? picomatch(onlyGlobs) : () => true;
   const deny  = skipGlobs.length ? picomatch(skipGlobs) : () => false;
