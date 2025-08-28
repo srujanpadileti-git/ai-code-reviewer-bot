@@ -41,5 +41,7 @@ jobs:
           TOKEN_BUDGET: "20000"
           MAX_PARALLEL: "3"
           USE_CACHE: "1"
-          CACHE_TTL_HOURS: "168" 
+          CACHE_TTL_HOURS: "168"
+          TRIAGE: "1"
+          TRIAGE_COMMENT: "1"
         run: node dist/index.js

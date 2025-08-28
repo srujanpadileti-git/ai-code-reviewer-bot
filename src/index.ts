@@ -1,5 +1,6 @@
 import * as core from "@actions/core";
 import { Octokit } from "@octokit/rest";
+import { computeTriage, applyTriage } from "./triage.js";
 
 import {
   getPRContext,
@@ -279,6 +280,14 @@ async function run() {
       } else {
         console.log("ℹ️  Auto-fix found nothing safe to change in the capped findings.");
       }
+    }
+    // === Day 12: PR Triage & Labels ===
+    const triageEnabled = (process.env.TRIAGE || "1") === "1";
+    const triageComment = (process.env.TRIAGE_COMMENT || "1") === "1";
+    if (triageEnabled) {
+      const triage = computeTriage(changed.map(f => ({ filename: f.filename, patch: f.patch })), allFindings);
+      console.log(`🧭 Triage => risk=${triage.risk}, size=${triage.sizeBucket}, labels=[${triage.labels.join(", ")}]`);
+      await applyTriage(commentsClient, owner, repo, prNumber, triage, { comment: triageComment });
     }
 
     // Post comments (unless dry-run)
