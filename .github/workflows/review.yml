@@ -31,4 +31,6 @@ jobs:
           COST_OUT_PER_1K: "0"
           ONLY: "src/**/*.ts,lib/**/*.js"
           SKIP: "dist/**,**/*.min.js,node_modules/**"
+          RULES_ONLY: "0"
+          ALLOW_CONSOLE: "0"
         run: node dist/index.js

@@ -10,6 +10,9 @@ export type ReviewConfig = {
   // metrics
   costInPer1K: number;   // optional: $ per 1k prompt tokens
   costOutPer1K: number;  // optional: $ per 1k completion tokens
+  rulesEnabled: boolean;
+  rulesOnly: boolean;
+  allowConsole: boolean;
 };
 
 function parseIntFromLabel(labels: string[], prefix: string, fallback: number) {
@@ -81,5 +84,10 @@ export function buildConfig(labels: string[], env: NodeJS.ProcessEnv): ReviewCon
   const costInPer1K  = Number(env.COST_IN_PER_1K || 0);
   const costOutPer1K = Number(env.COST_OUT_PER_1K || 0);
 
-  return { skipAll, dryRun, maxComments, onlyGlobs, skipGlobs, allowFile, costInPer1K, costOutPer1K };
+  const rulesOnly = labels.includes("ai-review:rules-only") || env.RULES_ONLY === "1";
+  const rulesEnabled = !labels.includes("ai-review:no-rules") && env.NO_RULES !== "1";
+  const allowConsole = labels.includes("ai-review:allow-console") || env.ALLOW_CONSOLE === "1";
+
+  return { skipAll, dryRun, maxComments, onlyGlobs, skipGlobs, allowFile, costInPer1K, costOutPer1K, rulesEnabled, rulesOnly, allowConsole };
+
 }

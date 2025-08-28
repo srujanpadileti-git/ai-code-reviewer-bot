@@ -1,3 +1,4 @@
+// src/index.ts
 import * as core from "@actions/core";
 import { Octokit } from "@octokit/rest";
 
@@ -18,20 +19,21 @@ import { aggregateFindings, type Finding } from "./aggregator.js";
 import { toCommentBody } from "./suggestions.js";
 import { buildConfig } from "./config.js";
 import { ensureRepoIndex, retrieveSimilar } from "./context.js";
+import { runRules } from "./rules.js";
 
 async function run() {
   try {
     // Tokens:
-    // - GITHUB_TOKEN (from Actions): use for reads + Checks API
-    // - REVIEWER_TOKEN (optional PAT): use for posting comments as YOU
+    // - GITHUB_TOKEN (from Actions): for reads + Checks API
+    // - REVIEWER_TOKEN (optional PAT): for posting comments as YOU (counts as contributions)
     const githubToken = process.env.GITHUB_TOKEN;
     if (!githubToken) throw new Error("GITHUB_TOKEN missing (Actions should provide this automatically).");
     const reviewerToken = process.env.REVIEWER_TOKEN || "";
 
     // Clients
-    const dataClient = new Octokit({ auth: githubToken });                     // reads (files/PR info)
+    const dataClient = new Octokit({ auth: githubToken });                      // reads (files/PR info)
     const commentsClient = new Octokit({ auth: reviewerToken || githubToken }); // review comments
-    const checksClient = new Octokit({ auth: githubToken });                   // Checks summary
+    const checksClient = new Octokit({ auth: githubToken });                    // Checks summary
 
     const { owner, repo, prNumber, headSha } = getPRContext();
     const fullRepo = `${owner}/${repo}`;
@@ -49,16 +51,18 @@ async function run() {
       )}], skip=[${cfg.skipGlobs.join(", ")}]`
     );
     console.log(`   Comments via ${reviewerToken ? "REVIEWER_TOKEN (your account)" : "GITHUB_TOKEN (bot)"}`);
+    console.log(`   Rules: enabled=${cfg.rulesEnabled}, rulesOnly=${cfg.rulesOnly}, allowConsole=${cfg.allowConsole}`);
 
-    // Day 6: Build/load repo RAG index and set Top-K
+    // Day 6: Build/load repo RAG index (fail-open) and set Top-K
     const ragK = Math.max(0, Number(process.env.RAG_K || "6"));
     const repoIndex = ragK > 0 ? await ensureRepoIndex(labels, process.env) : null;
     console.log(`📚 RAG index: ${repoIndex ? repoIndex.entries.length : 0} chunks loaded, topK=${ragK}`);
 
+    // Metrics
     const runStart = Date.now();
-    let totalPrompt = 0,
-      totalOut = 0,
-      totalTokens = 0;
+    let totalPrompt = 0;
+    let totalOut = 0;
+    let totalTokens = 0;
 
     const allFindings: Finding[] = [];
     const changed = await getChangedFiles(dataClient, owner, repo, prNumber);
@@ -72,7 +76,7 @@ async function run() {
         continue;
       }
 
-      // Language scope (Day 4/5: TS/JS)
+      // Language scope (TS/JS for now)
       const lang = detectLang(path);
       if (!["ts", "js"].includes(lang)) continue;
 
@@ -87,7 +91,22 @@ async function run() {
         // AST context around the changed range
         const ctx = extractContextForRange(path, source, h.startLine, h.endLine);
 
-        // Retrieve related repo context (RAG)
+        // 1) Deterministic rules on the changed lines (no tokens)
+        if (cfg.rulesEnabled) {
+          const ruleFindings = runRules({
+            path,
+            source,
+            startLine: h.startLine,
+            endLine: h.endLine,
+            allowConsole: cfg.allowConsole,
+          });
+          allFindings.push(...ruleFindings);
+        }
+
+        // 2) Skip model entirely if rules-only mode is on
+        if (cfg.rulesOnly) continue;
+
+        // Retrieve related repo context (RAG) for the model
         const related = ragK > 0 ? await retrieveSimilar(repoIndex, ctx.snippet, path, ragK) : [];
 
         // Build messages for the model
@@ -175,7 +194,8 @@ async function run() {
       `- Tokens: prompt **${totalPrompt}**, out **${totalOut}**, total **${totalTokens}**\n` +
       `- Time: **${seconds}s**\n` +
       `- ${costLine}\n` +
-      `- ${ragLine}\n\n` +
+      `- ${ragLine}\n` +
+      `- Rules: enabled **${cfg.rulesEnabled}**, rules-only **${cfg.rulesOnly}**, allowConsole **${cfg.allowConsole}**\n\n` +
       (top.length
         ? top
             .map(
@@ -194,7 +214,7 @@ async function run() {
       console.log(`  ⚠️  Failed to post Checks summary — ${String(e?.message || e).slice(0, 200)}`);
     }
 
-    console.log("\n✅ Day 6 complete: comments + summary with RAG context.");
+    console.log("\n✅ Day 7 complete: rule-based checks + RAG-aware review posted.");
   } catch (err: any) {
     core.setFailed(err.message);
   }
